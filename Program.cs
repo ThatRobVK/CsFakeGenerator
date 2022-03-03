@@ -1,9 +1,7 @@
-﻿using System.CodeDom;
-using System.Diagnostics;
-using System.Reflection;
+﻿using System.Reflection;
+using System.Runtime.CompilerServices;
 using System.Text;
 using Microsoft.Build.Construction;
-using Microsoft.CSharp;
 
 namespace CsFakeGenerator
 {
@@ -64,13 +62,16 @@ namespace CsFakeGenerator
                 if (!type.IsNested)
                 {
                     indentLevel = 0;
-                    var filePath = outputFolder + Path.DirectorySeparatorChar + GetTypeName(type, false) + ".cs";
+                    var fileOutputPath = GetOutputPathForType(outputFolder, type);
+                    var filePath = fileOutputPath + GetTypeName(type, false) + ".cs";
+
+                    if (!Directory.Exists(fileOutputPath)) Directory.CreateDirectory(fileOutputPath);
+                    
+                    Console.WriteLine($"Writing type {type.Name} to file {filePath}");
                     File.WriteAllText(filePath, ProcessType(type));
                     generatedCsFiles.Add(new FileInfo(filePath));
                 }
             }
-
-            CreateProjectFile(assembly, inputFile, outputFolder);
         }
 
         /// <summary>
@@ -125,6 +126,19 @@ namespace CsFakeGenerator
                 indentLevel++;
             }
 
+            // For delegates, use a single line delcaration
+            if (IsDelegate(type))
+            {
+                typeOutput.Append(Indent).Append(GetDelegateDeclaration(type)).Append('\n');
+                if (typeHasNamespace)
+                {
+                    indentLevel--;
+                    typeOutput.Append("}\n"); // Close namespace braces
+                }
+
+                return typeOutput.ToString();
+            }
+            
             // Type declaration
             typeOutput.Append(Indent).Append(GetTypeDeclaration(type)).Append('\n');
             typeOutput.Append(Indent).Append("{\n");
@@ -183,6 +197,21 @@ namespace CsFakeGenerator
             return typeOutput.ToString();
         }
 
+        private static string GetDelegateDeclaration(Type type)
+        {
+            var typeDeclaration = new StringBuilder(Indent);
+            
+            typeDeclaration.Append("public delegate ");
+            var invokeMethod = type.GetMethod("Invoke");
+            if (invokeMethod != null)
+            {
+                typeDeclaration.Append(GetTypeName(invokeMethod.ReturnType, true)).Append(' ');
+                typeDeclaration.Append(GetTypeName(type, false));
+                typeDeclaration.Append(GetMethodParameters(invokeMethod));
+            }
+            return typeDeclaration.Append(';').ToString();
+        }
+
         /// <summary>
         /// Lists out the enum's fields with their values.
         /// </summary>
@@ -220,7 +249,8 @@ namespace CsFakeGenerator
                 fieldInfo.ReflectedType.IsSealed && !fieldInfo.IsStatic) return string.Empty;
 
             // Field type and name
-            fieldDeclaration.Append(GetTypeName(fieldInfo.FieldType, true)).Append(' ').Append(fieldInfo.Name).Append(";\n");
+            fieldDeclaration.Append(GetTypeName(fieldInfo.FieldType, true)).Append(GetGenericTypeArguments(fieldInfo.FieldType, true))
+                .Append(' ').Append(fieldInfo.Name).Append(";\n");
             
             return fieldDeclaration.ToString();
         }
@@ -303,15 +333,8 @@ namespace CsFakeGenerator
             if (methodInfo.ReflectedType != null && methodInfo.ReflectedType.IsAbstract &&
                 methodInfo.ReflectedType.IsSealed && !methodInfo.IsStatic) return string.Empty;
 
-            if (methodInfo.ReturnType == typeof(void))
-            {
-                methodDeclaration.Append("void");
-            }
-            else
-            {
-                methodDeclaration.Append(GetTypeName(methodInfo.ReturnType, true));
-                methodDeclaration.Append(GetGenericTypeArguments(methodInfo.ReturnType, true));
-            }
+            methodDeclaration.Append(GetTypeName(methodInfo.ReturnType, true));
+            methodDeclaration.Append(GetGenericTypeArguments(methodInfo.ReturnType, true));
 
             // Name, parameters
             methodDeclaration.Append(' ').Append(methodInfo.Name);
@@ -351,6 +374,11 @@ namespace CsFakeGenerator
             return methodDeclaration.ToString();
         }
 
+        /// <summary>
+        /// Determines whether a method is overridden and returns its modifier or an empty string.
+        /// </summary>
+        /// <param name="methodInfo">The method to check.</param>
+        /// <returns>One of "abstract", "override", "new" or an empty string, depending on the method.</returns>
         private static string GetOverrideModifier(MethodInfo methodInfo)
         {
             // Not required on an interface
@@ -364,23 +392,32 @@ namespace CsFakeGenerator
 
             if (methodInfo.GetBaseDefinition().IsAbstract)
             {
-                // Override abstract base class member
+                // Overriding an abstract member
                 return "override ";
             }
-
+            
             if (methodInfo.DeclaringType != methodInfo.ReflectedType)
             {
-                // Member is declared on another type (i.e. inherited)
-                if ((methodInfo.Attributes & MethodAttributes.Final) == 0 && !methodInfo.GetBaseDefinition().IsVirtual)
+                // Find the original definition of the method
+                var baseMethod = methodInfo.GetBaseDefinition();
+                if (methodInfo.ReflectedType != null && methodInfo.ReflectedType.BaseType != null)
                 {
-                    // Overrides are flagged as final
-                    return "override ";
-                }
+                    // If this is inherited directly from the base class, use its implementation instead
+                    var inheritedMethod = methodInfo.ReflectedType.BaseType.GetMethods().FirstOrDefault(baseTypeMethod => baseTypeMethod.GetBaseDefinition() == methodInfo.GetBaseDefinition() &&
+                        baseTypeMethod.DeclaringType == methodInfo.ReflectedType.BaseType);
 
-                // If not final, it's hiding the base method
-                return "new ";
+                    baseMethod = inheritedMethod ?? baseMethod;
+                }
+                
+                // Method has a base so is new or override depending on whether the base is final
+                return baseMethod.IsFinal ? "new " : "override ";
             }
 
+            // Method isn't final (e.g. can be overridden), not static and the type it's on is a class - it's virtual
+            if (!methodInfo.IsFinal && !methodInfo.IsStatic && methodInfo.ReflectedType != null 
+                && methodInfo.ReflectedType.IsClass) return "virtual ";
+
+            // No special conditions apply, so no modifiers required
             return string.Empty;
         }
 
@@ -402,17 +439,16 @@ namespace CsFakeGenerator
 
                 typeDeclaration.Append("class ");
             }
-
-            if (type.IsInterface) typeDeclaration.Append("interface ");
-            if (type.IsEnum) typeDeclaration.Append("enum ");
-            if (!type.IsEnum && type.IsValueType) typeDeclaration.Append("struct ");
+            else if (type.IsInterface) typeDeclaration.Append("interface ");
+            else if (type.IsEnum) typeDeclaration.Append("enum ");
+            else if (!type.IsEnum && type.IsValueType) typeDeclaration.Append("struct ");
 
             // Add name of type with any generic arguments
             typeDeclaration.Append(GetTypeName(type, false) + GetGenericTypeArguments(type, false) + GetGenericTypeArgumentRestrictions(type));
 
             // Do not add interfaces or inheritance on enums
             if (type.IsEnum) return typeDeclaration.ToString();
-
+            
             var inherits = new List<string>();
             if (type.BaseType != null && type.BaseType != typeof(Object) && type.BaseType != typeof(Enum) && type.BaseType != typeof(ValueType))
             {
@@ -437,9 +473,15 @@ namespace CsFakeGenerator
         /// <returns>The name, fully qualified or not, with generic markers removed and corrected for nested classes.</returns>
         private static string GetTypeName(Type type, bool fullName)
         {
-            var typeName = fullName ? type.FullName ?? type.Name : type.Name;
+            if (type == typeof(void)) return "void";
+            
+            // Get the type name, force full name if no FullName set, but if it's a generic parameter, e.g. T then don't
+            var typeName = fullName ? type.FullName ?? type.Namespace + '.' + type.Name : type.Name;
+            if (type.IsGenericParameter) typeName = type.Name;
+            
             if (typeName.Contains('`')) typeName = typeName.Substring(0, typeName.IndexOf("`", StringComparison.Ordinal)); // Remove `1 from generic types
             if (typeName.Contains('+')) typeName = typeName.Replace('+', '.'); // Replace + from nested types
+            if (typeName.Contains('&')) typeName = typeName.Replace("&", ""); // Replace & for byref parameters
             
             return typeName;
         }
@@ -454,7 +496,8 @@ namespace CsFakeGenerator
             var parameters = new List<string>();
             foreach (var parameterInfo in methodInfo.GetParameters())
             {
-                parameters.Add(string.Concat(GetTypeName(parameterInfo.ParameterType, true),
+                var byref = parameterInfo.ParameterType.IsByRef ? "ref " : string.Empty;
+                parameters.Add(string.Concat(byref, GetTypeName(parameterInfo.ParameterType, true),
                     GetGenericTypeArguments(parameterInfo.ParameterType, true),
                     " ", parameterInfo.Name));
             }
@@ -469,7 +512,7 @@ namespace CsFakeGenerator
         /// <returns>The generic arguments of the specified type, or an empty string if this type does not take generic arguments.</returns>
         private static string GetGenericTypeArguments(Type type, bool useTypeNames)
         {
-            if (!type.IsGenericType) return string.Empty;
+            if (!type.IsGenericType && type.GetGenericArguments().Length == 0) return string.Empty;
             
             var typeDefinition = useTypeNames ? type : type.GetGenericTypeDefinition();
             var genericArgumentNames = new List<string>();
@@ -577,5 +620,17 @@ namespace CsFakeGenerator
             return memberInfo.DeclaringType != memberInfo.ReflectedType;
         }
 
+        private static string GetOutputPathForType(string outputFolder, Type type)
+        {
+            if (type.Namespace != null)
+                return outputFolder + Path.DirectorySeparatorChar + type.Namespace.Replace('.', Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+
+            return outputFolder + Path.DirectorySeparatorChar;
+        }
+
+        private static bool IsDelegate(Type type)
+        {
+            return type.BaseType == typeof(MulticastDelegate);
+        }
     }
 }
